@@ -1,27 +1,29 @@
 ############################
 #### Data Preprocessing ####
 ############################
-rm(list=ls()); gc()
-
 source("./R/util.R")
 
 require_libraries(c("tidyr",
                     "dplyr",
                     "magrittr",
                     "stringr",
+                    "scales",
                     "broom",
-                    "Matrix"))
-
+                    "Matrix",
+                    "purrr"))
 
 # experimental design parameters
 #----prediction ending point
-pred_end<-7
+pred_end<-7 #only collect data within 7 days since admission
 
 #-----prediction point
 pred_in_d_opt<-c(1,2)
 
 #-----prediction tasks
 pred_task_lst<-c("stg1up","stg2up","stg3")
+
+#-----whether values should be carried over?
+carry_over<-T
 
 #-----feature selection type
 fs_type_opt<-c("no_fs","rm_scr_bun")
@@ -180,7 +182,7 @@ for(pred_in_d in pred_in_d_opt){
                   list(X_surv=X_surv,y_surv=y_surv),
                   proc_bm)
     
-    saveRDS(data_ds,file=paste0("./data/preproc/data_ds_",pred_in_d,"d/",pred_task,".rda"))
+    saveRDS(data_ds,file=paste0("./data/preproc/",pred_in_d,"d_",pred_task,".rda"))
     
     #---------------------------------------------------------------------------------------------
     lapse_tsk<-Sys.time()-start_tsk

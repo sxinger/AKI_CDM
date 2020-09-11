@@ -3,8 +3,20 @@ title: "Building and Validating Predictive Models for Acute Kidney Injury (AKI) 
 author: "xing song"
 date: "Feburary 09, 2019"
 output: html_document
+params:
+  preprocess: TRUE
 ---
-### Stage 2.1: Predictive Models Validation (Benchmark)   
+
+### Data Preparation    
+
+If `preprocess==TRUE`, it will first run `data_preproc.R` to preprocess and transform raw data into to a discrete-survival-like representation, which will used for model validation as well as refitting. At this preparation stage, the raw data tables will be cleaned and transformed to a discrete-survival-like representation, which will be used for stage 2.1 and stage 2.2. To reduce the burden on memory requirements, the ETL (extract, transform, load) process will be performed in chunks with respect to **distinct prediction task, encounter years and variable types**. Meanwhile, indices for random partitioning will be assigned to each encounter.
+
+```{bash preprocess, engine.opts='-l',include=F,eval=params$preprocess}
+Rscript -e data_preproc.R
+```
+
+
+### Stage 2.1: Validating Transported Model (Benchmark)   
 
 In this experiment, we will validate the benchmark predictive model by quasi-replicating the model by [*Koyner et al*] for AKI risk prediction on the adult inpatients, which was trained on KUMC's data using PCORnet common data model. This learning frame work by Koyner et al is, by far, the best reported general inpatients AKI prediction model, which is based on a tuned gradient boosting machine in a discrete time survival analysis framework with pre-selected EHR data elements. We aim to extend this benchmark prediction model by including novel elements from PCORnet CDM, while effectively automate the manual efforts of feature pre-selection and cleaning. The primary outcomes of this study were the development of AKI stage ≥ 1, AKI stage ≥ 2, and AKI stage 3 in the next 24 and 48 hours. KUMC's model and some auxillary data will be delivered via securefile. 
 
@@ -13,6 +25,9 @@ In this experiment, we will validate the benchmark predictive model by quasi-rep
 ***
 
 ```{r setup, include=F}
+rm(list=ls())
+gc()
+
 #source utility functions
 source("./R/util.R")
 
@@ -29,6 +44,9 @@ require_libraries(c("tidyr",
                     "knitr",
                     "kableExtra",
                     "ggplot2",
+                    "ggrepel",
+                    "gridExtra",
+                    "ggpubr",
                     "openxlsx"))
 
 # experimental design parameters
@@ -50,863 +68,645 @@ rm_key<-c('2160-0','38483-4','14682-9','21232-4','35203-9','44784-7','59826-8',
           '11065-0','3094-0','35234-4','14937-7',
           '48642-3','48643-1', #eGFR
           '3097-3','44734-2','BUN_SCR')
-
 ```
 
-
-#### Preparation    
-
-By running `Part I` of "render_report.R", the raw data tables should have already been collected and saved in the local `./data` folder (Note: these data tables are not visiable in the github ./data folder, but should be visible in the corresponding folder locally), that are
-
-* `Table1.rda`: AKI patieht cohort table;       
-
-* `AKI_DEMO.rda`: CDM demographic table cut for AKI cohort;   
-
-* `AKI_VITAL.rda`: CDM vital table cut for AKI cohort;    
-
-* `AKI_LAB.rda`: CDM lab table cut for AKI cohort;    
-
-* `AKI_DX.rda`: CDM diagnosis table cut for AKI cohort;   
-
-* `AKI_PX.rda`: CDM procedure table cut for AKI cohort;   
-
-* `AKI_MED.rda`: CDM prescribing medication table cut for AKI cohort;   
-
-
-***
-
-#### Objective 2.1: Data Cleaning and Representation
-
-In this section, the raw data tables will be cleaned and transformed to a discrete-survival-like representation, which will be used in the final modeling stage. To reduce the burden on memory requirments, the ETL (extract, transform, load) process will be performed in chunks with respect to **distinct prediction task, encounter years and variable types**. Meanwhile, indices for random paritioning will be assigned to each encounter. The ETL progress will be reported as follows:
-
-
-```{r preprocess, include=F,eval=F}
-# collect and format variables on daily basis 
-n_chunk<-4 #memory-efficient
-
-tbl1<-readRDS("./data//Table1.rda") %>%
-  dplyr::mutate(yr=as.numeric(format(strptime(ADMIT_DATE, "%Y-%m-%d %H:%M:%S"),"%Y")))
-
-#--by chunks: encounter year
-enc_yr<-tbl1 %>%
-  dplyr::select(yr) %>%
-  unique %>% arrange(yr) %>%
-  filter(yr>2009) %>%
-  dplyr::mutate(chunk=ceiling((yr-2009)/(n()/n_chunk)))
-
-#--by variable type
-var_type<-c("demo","vital","lab","dx","px","med")
-
-for(pred_in_d in pred_in_d_opt){
-  #--determine update time window
-  tw<-as.double(seq(0,pred_end))
-  if(pred_in_d>1){
-    tw<-tw[-seq_len(pred_in_d-1)]
-  } 
-
-    #--save results as array
-  for(pred_task in pred_task_lst){
-    start_tsk<-Sys.time()
-    cat("Start variable collection for task",pred_task,".\n")
-    #---------------------------------------------------------------------------------------------
-    
-    var_by_yr<-list()
-    var_bm<-list()
-    rsample_idx<-c()
-    
-    for(i in seq_len(n_chunk)){
-      start_i<-Sys.time()
-      cat("...start variable collection for year chunk",i,".\n")
-      
-      #--collect end_points
-      yr_i<-enc_yr$yr[enc_yr$chunk==i]
-      dat_i<-tbl1 %>% filter(yr %in% yr_i) %>%
-        dplyr::select(ENCOUNTERID,yr,
-                      NONAKI_SINCE_ADMIT,
-                      AKI1_SINCE_ADMIT,
-                      AKI2_SINCE_ADMIT,
-                      AKI3_SINCE_ADMIT) %>%
-        gather(y,dsa_y,-ENCOUNTERID,-yr) %>%
-        filter(!is.na(dsa_y)) %>%
-        dplyr::mutate(y=recode(y,
-                               "NONAKI_SINCE_ADMIT"=0,
-                               "AKI1_SINCE_ADMIT"=1,
-                               "AKI2_SINCE_ADMIT"=2,
-                               "AKI3_SINCE_ADMIT"=3)) %>%
-        dplyr::mutate(y=as.numeric(y))
-      
-      if(pred_task=="stg1up"){
-        dat_i %<>%
-          dplyr::mutate(y=as.numeric(y>0)) %>%
-          group_by(ENCOUNTERID) %>% top_n(n=1L,wt=dsa_y) %>% ungroup
-      }else if(pred_task=="stg2up"){
-        dat_i %<>%
-          group_by(ENCOUNTERID) %>%
-          dplyr::filter(max(y)!=1) %>% ungroup %>%   #filter out entire AKI1 encounters
-          filter(y!=1) %>%                           #filter AKI1 stages for AKI2 cases
-          dplyr::mutate(y=as.numeric(y>=2)) %>%
-          group_by(ENCOUNTERID) %>% top_n(n=1L,wt=dsa_y) %>% ungroup
-      }else if(pred_task=="stg3"){
-        dat_i %<>%
-          group_by(ENCOUNTERID) %>%
-          filter(max(y) %in% c(1,2)) %>% ungroup %>%   #filter out entire AKI1,2 encounters
-          filter(!y %in% c(1,2)) %>%                   #filter out AKI1,2 stages for AKI3 cases
-          dplyr::mutate(y=as.numeric(y>2)) %>%
-          group_by(ENCOUNTERID) %>% top_n(n=1L,wt=dsa_y) %>% ungroup
-      }else{
-        stop("prediction task is not valid!")
-      }
-      
-      #--random sampling
-      rsample_idx %<>%
-        bind_rows(dat_i %>% 
-                    dplyr::select(ENCOUNTERID,yr) %>%
-                    unique %>%
-                    dplyr::mutate(cv10_idx=sample(1:10,n(),replace=T)))
-      
-      #--ETL variables
-      X_surv<-c()
-      y_surv<-c()
-      var_etl_bm<-c()
-      for(v in seq_along(var_type)){
-        start_v<-Sys.time()
-        
-        #extract
-        var_v<-readRDS(paste0("./data/AKI_",toupper(var_type[v]),".rda")) %>%
-          semi_join(dat_i,by="ENCOUNTERID")
-        
-        if(var_type[v] != "demo"){
-          if(var_type[v] == "med"){
-            var_v %<>% 
-              transform(value=strsplit(value,","),
-                        dsa=strsplit(dsa,",")) %>%
-              unnest(value,dsa) %>%
-              dplyr::mutate(value=as.numeric(value),
-                            dsa=as.numeric(dsa))
-          }
-          var_v %<>% filter(dsa <= pred_end)
-        }
-        
-        #transform
-        var_v<-format_data(dat=var_v,
-                           type=var_type[v],
-                           pred_end=pred_end)
-        
-        Xy_surv<-get_dsurv_temporal(dat=var_v,
-                                    censor=dat_i,
-                                    tw=tw,
-                                    pred_in_d=pred_in_d)
-        
-        #load
-        X_surv %<>% bind_rows(Xy_surv$X_surv) %>% unique
-        y_surv %<>% bind_rows(Xy_surv$y_surv) %>% unique
-        
-        lapse_v<-Sys.time()-start_v
-        var_etl_bm<-c(var_etl_bm,paste0(lapse_v,units(lapse_v)))
-        cat("\n......finished ETL",var_type[v],"for year chunk",i,"in",lapse_v,units(lapse_v),".\n")
-      }
-      var_by_yr[[i]]<-list(X_surv=X_surv,
-                           y_surv=y_surv)
-      
-      lapse_i<-Sys.time()-start_i
-      var_etl_bm<-c(var_etl_bm,paste0(lapse_i,units(lapse_i)))
-      cat("\n...finished variabl collection for year chunk",i,"in",lapse_i,units(lapse_i),".\n")
-      
-      var_bm[[i]]<-data.frame(bm_nm=c(var_type,"overall"),
-                              bm_time=var_etl_bm,
-                              stringsAsFactors = F)
-    }
-    
-    #--save preprocessed data
-    saveRDS(rsample_idx,file=paste0("./data/preproc/",pred_in_d,"d_rsample_idx_",pred_task,".rda"))
-    saveRDS(var_by_yr,file=paste0("./data/preproc/",pred_in_d,"d_var_by_yr_",pred_task,".rda"))
-    saveRDS(var_bm,file=paste0("./data/preproc/",pred_in_d,"d_var_bm",pred_task,".rda"))
-    
-    #---------------------------------------------------------------------------------------------
-    lapse_tsk<-Sys.time()-start_tsk
-    cat("\nFinish variable ETL for task:",pred_task,"in",pred_in_d,"days",",in",lapse_tsk,units(lapse_tsk),".\n")
-  }
-}
-```
-
-The final preprocessed intermediate tables from this code chunk should be found in the `./data/preproc/...` folder as the following intermediate data tables for different prediction tasks:   
-
-* For AKI stage ≥ 1 in 24 hours: `1d_rsample_idx_stg1up.rda`, `1d_var_by_yr_stg1up.rda`, `1d_var_bm_stg1up.rda`   
-
-* For AKI stage ≥ 2 in 24 hours: `1d_rsample_idx_stg2up.rda`, `1d_var_by_yr_stg2up.rda`, `1d_var_bm_stg2up.rda`   
- 
-* For AKI stage = 3 in 24 hours: `1d_rsample_idx_stg3.rda`, `1d_var_by_yr_stg3.rda`, `1d_var_bm_stg3.rda`   
-
-* For AKI stage ≥ 1 in 48 hours: `2d_rsample_idx_stg1up.rda`, `2d_var_by_yr_stg1up.rda`, `1d_var_bm_stg1up.rda`   
- 
-* For AKI stage ≥ 2 in 48 hours: `2d_rsample_idx_stg2up.rda`, `2d_var_by_yr_stg2up.rda`, `1d_var_bm_stg2up.rda`   
- 
-* For AKI stage = 3 in 48 hours: `2d_rsample_idx_stg3.rda`, `2d_var_by_yr_stg3.rda`, `1d_var_bm_stg3.rda`   
-
-
-***
-
-#### Objective 2.2: Benchmark Model Validation
 
 After receiving the `model_kumc.zip` from KUMC via securefile, unzip the data and save under `.../data/model_kumc`. The model will be validated on the overall cohort from the site by generating a AKI risk score for different AKI stages. The validation progress will be reported as follows:
 
 ```{r benchmark, echo=F, eval=F}
-rm(list=c("X_surv","y_surv", "Xy_surv","dat_i","var_v",
-          "rsample_idx","var_by_yr","var_bm"))
-gc() #release some memory
-
-# collect and format variables on daily basis 
-n_chunk<-4 #memory-efficient
+boots<-30
 
 for(pred_in_d in pred_in_d_opt){
-  
-  for(pred_task in pred_task_lst){
-    start_tsk<-Sys.time()
-    #---------------------------------------------------------------------------------------------
-    var_by_task<-readRDS(paste0("./data/preproc/",pred_in_d,"d_var_by_yr_",pred_task,".rda"))
-    
-    for(fs_type in fs_type_opt){
-      #--prepare testing set
-      X_ts<-c()
-      y_ts<-c()
-      for(i in seq_len(n_chunk)){
-        var_by_yr<-var_by_task[[i]]
+    #initialize empty vectors for saving results (1d-,2d-, prediction)
+    perf_full_bs<-c()
+    perf_overall_bs<-c()
+    perf_calib_bs<-c()
+      
+    for(pred_task in pred_task_lst){
+      #auxiliary table (for subgroup analysis)
+      data_ds<-readRDS(paste0("./data/preproc/",params$site,"/data_ds_",pred_in_d,"d.rda"))
+      dat<-readRDS(paste0("./data/preproc/",params$site,"/data_proc.rda"))
+      tbl1<-dat$cohort %>%
+        dplyr::select(ENCOUNTERID,SERUM_CREAT_BASE, ADMIT_DATE) %>%
+        inner_join(dat$demo %>%
+                     filter(key=="AGE") %>%
+                     dplyr::select(ENCOUNTERID,key,value) %>%
+                     spread(key,value) %>%
+                     mutate(AGE=as.numeric(AGE)),
+                   by="ENCOUNTERID") %>%
+        mutate(yr=format(ADMIT_DATE,"%Y"),yr=as.numeric(yr)) %>%
+        select(-ADMIT_DATE)
         
-        X_ts %<>% bind_rows(var_by_yr[["X_surv"]])
-        y_ts %<>% bind_rows(var_by_yr[["y_surv"]])
+        for(fs_type in fs_type_opt){
+          #---------------------------------------------------------------------------------------------
+          start_i<-Sys.time()
+          
+          #--load model
+          valid_mod<-readRDS(paste0("./data/",model,"_validation/",ref_site,"/",pred_in_d,"d_",fs_type,"_",pred_task,".rda"))
+          ref_mod<-valid_mod$model
+          tr_key<-data.frame(key = ref_mod$feature_names,
+                                 stringsAsFactors = F)
+          #--prepare testing set
+          X_ts<-data_ds[[pred_task]][[1]]
+          y_ts<-data_ds[[pred_task]][[2]]
+          
+          #--pre-filter
+          if(fs_type=="rm_scr_bun"){
+            X_ts %<>%
+              filter(!(key %in% c(rm_key,paste0(rm_key,"_change"))))
+          }
+          
+          #--transform testing matrix
+          y_ts %<>%
+            arrange(ENCOUNTERID,dsa_y) %>%
+            unite("ROW_ID",c("ENCOUNTERID","dsa_y")) %>%
+            arrange(ROW_ID) %>%
+            unique
+          
+          X_ts %<>% 
+            unite("ROW_ID",c("ENCOUNTERID","dsa_y")) %>%
+            semi_join(y_ts,by="ROW_ID") %>%
+            semi_join(tr_key, by="key")
+              
+          x_add<-tr_key %>%
+                anti_join(data.frame(key = unique(X_ts$key),
+                                     stringsAsFactors = F),
+                          by="key")
+            
+          y_ts %<>% semi_join(X_ts,by="ROW_ID")
+            
+          #align with training
+          if(nrow(x_add)>0){
+            X_ts %<>%
+              arrange(ROW_ID) %>%
+              bind_rows(data.frame(ROW_ID = rep("0_0",nrow(x_add)),
+                                   dsa = -99,
+                                   key = x_add$key,
+                                   value = 0,
+                                   stringsAsFactors=F))
+          }
+          
+          X_ts %<>%
+            long_to_sparse_matrix(df=.,
+                                  id="ROW_ID",
+                                  variable="key",
+                                  val="value")
+          if(nrow(x_add)>0){
+            X_ts<-X_ts[-1,]
+          }
+          
+          X_ts<-X_ts[,tr_key$key]
+            
+          #check alignment
+          if (!all(row.names(X_ts)==y_ts$ROW_ID)){
+            warning("row ids don't match!")
+          }
+          if (!all(tr_key$key==colnames(X_ts))){
+            warning("feature names don't match!")
+          }
+          
+          dtest<-xgb.DMatrix(data=X_ts,label=y_ts$y)
+          fitted<-predict(ref_mod,X_ts)
+          valid_orig<-data.frame(y_ts,
+                                 pred = fitted,
+                                 stringsAsFactors = F) %>%
+            mutate(ENCOUNTERID=gsub("_.*","",ROW_ID),
+                   day_at=as.numeric(gsub(".*_","",ROW_ID))) %>%
+            inner_join(tbl1,by="ENCOUNTERID") %>%
+            dplyr::mutate(age=cut(AGE,breaks=c(0,45,65,Inf),include.lowest=T,right=F)) %>%
+            mutate(admit_scr=cut(SERUM_CREAT_BASE,breaks=c(0,1,2,3,Inf),include.lowest=T,right=F))
+          
+          n<-nrow(valid_orig)
+          
+          for(b in 1:boots){
+            #--bootstrapping
+            idxset<-sample(1:n,n,replace=T)
+            valid<-valid_orig %>% dplyr::slice(idxset)
+            
+            #--collect performance metrics
+            #full ROC/PRC curve
+            perf_full<-get_perf_summ(pred=valid$pred,
+                                     real=valid$y,
+                                     keep_all_cutoffs=T)$perf_at %>%
+              dplyr::select(cutoff,rec_sens,spec,prec) %>%
+              mutate(cutoff=round(cutoff,3)) %>%
+              group_by(cutoff) %>%
+              dplyr::summarise(rec_sens=mean(rec_sens),
+                               spec=mean(spec),
+                               prec=mean(prec),
+                               .groups="drop") %>%
+              dplyr::mutate(size=nrow(valid),
+                            grp="Overall",
+                            pred_task=pred_task)
+            
+            #overall
+            perf_overall<-get_perf_summ(pred=valid$pred,
+                                        real=valid$y,
+                                        keep_all_cutoffs=F)$perf_summ %>%
+              dplyr::filter(overall_meas %in% perf_metrics) %>%
+              dplyr::mutate(size=nrow(valid),
+                            grp="Overall",
+                            pred_task=pred_task)
+            
+            calib<-get_calibr(pred=valid$pred,
+                              real=valid$y) %>%
+              mutate(grp="ALL",pred_task=pred_task)
+            
+            
+            #subgroup-by calendar year
+            subgrp_calyr_full<-c()
+            subgrp_calyr<-c()
+            subgrp_calyr_calib<-c()
+            for(valid_type in c("int","ext")){
+              if(valid_type=="int"){
+                valid_grp<-valid %>% filter(yr<=2016)
+              }else{
+                valid_grp<-valid %>% filter(yr>2016)
+              }
+              grp_summ<-get_perf_summ(pred=valid_grp$pred,
+                                      real=valid_grp$y,
+                                      keep_all_cutoffs=F)$perf_summ %>%
+                dplyr::filter(overall_meas %in% perf_metrics)
+              
+              subgrp_calyr_full %<>%
+                bind_rows(get_perf_summ(pred=valid_grp$pred,
+                                        real=valid_grp$y,
+                                        keep_all_cutoffs=T)$perf_at %>%
+                            dplyr::select(cutoff,rec_sens,spec,prec) %>%
+                            mutate(cutoff=round(cutoff,6)) %>%
+                            group_by(cutoff) %>%
+                            dplyr::summarise(rec_sens=mean(rec_sens),
+                                             spec=mean(spec),
+                                             prec=mean(prec),
+                                             .groups="drop") %>%
+                            dplyr::mutate(grp=paste0("Subgrp_VTYPE:",valid_type),
+                                          pred_task=pred_task))
+              
+              subgrp_calyr %<>% 
+                bind_rows(grp_summ %>% 
+                            dplyr::mutate(size=nrow(valid_grp),
+                                          grp=paste0("Subgrp_VTYPE:",valid_type),
+                                          pred_task=pred_task))
+              subgrp_calyr_calib %<>%
+                bind_rows(get_calibr(pred=valid_grp$pred,
+                                     real=valid_grp$y) %>%
+                            dplyr::mutate(grp=paste0("Subgrp_VTYPE:",valid_type),
+                                          pred_task=pred_task))
+            }
+            
+            
+            #subgroup-by day since admission
+            subgrp_day_full<-c()
+            subgrp_day<-c()
+            subgrp_day_calib<-c()
+            for(d in 2:7){
+              valid_grp<-valid %>% filter(day_at==d)
+              grp_summ<-get_perf_summ(pred=valid_grp$pred,
+                                      real=valid_grp$y,
+                                      keep_all_cutoffs=F)$perf_summ %>%
+                dplyr::filter(overall_meas %in% perf_metrics)
+              
+              subgrp_day_full %<>%
+                bind_rows(get_perf_summ(pred=valid_grp$pred,
+                                        real=valid_grp$y,
+                                        keep_all_cutoffs=T)$perf_at %>%
+                            dplyr::select(cutoff,rec_sens,spec,prec) %>%
+                            mutate(cutoff=round(cutoff,3)) %>%
+                            group_by(cutoff) %>%
+                            dplyr::summarise(rec_sens=mean(rec_sens),
+                                             spec=mean(spec),
+                                             prec=mean(prec),
+                                             .groups="drop") %>%
+                            dplyr::mutate(grp=paste0("Subgrp_DAY:",d),
+                                          pred_task=pred_task))
+              
+              subgrp_day %<>% 
+                bind_rows(grp_summ %>% 
+                            dplyr::mutate(size=nrow(valid_grp),
+                                          grp=paste0("Subgrp_DAY:",d),
+                                          pred_task=pred_task))
+              subgrp_day_calib %<>%
+                bind_rows(get_calibr(pred=valid_grp$pred,
+                                     real=valid_grp$y) %>%
+                            dplyr::mutate(grp=paste0("Subgrp_DAY:",d),
+                                          pred_task=pred_task))
+            }
+            
+            #subgroup-age
+            subgrp_age_full<-c()
+            subgrp_age<-c()
+            subgrp_age_calib<-c()
+            grp_vec<-unique(valid$age)
+            for(grp in seq_along(grp_vec)){
+              valid_grp<-valid %>% filter(age==grp_vec[grp])
+              grp_summ<-get_perf_summ(pred=valid_grp$pred,
+                                      real=valid_grp$y,
+                                      keep_all_cutoffs=F)$perf_summ %>%
+                dplyr::filter(overall_meas %in% perf_metrics)
+              
+              subgrp_age_full %<>%
+                bind_rows(get_perf_summ(pred=valid_grp$pred,
+                                        real=valid_grp$y,
+                                        keep_all_cutoffs=T)$perf_at %>%
+                            dplyr::select(cutoff,rec_sens,spec,prec) %>%
+                            mutate(cutoff=round(cutoff,3)) %>%
+                            group_by(cutoff) %>%
+                            dplyr::summarise(rec_sens=mean(rec_sens),
+                                             spec=mean(spec),
+                                             prec=mean(prec),
+                                             .groups="drop") %>%
+                            dplyr::mutate(grp=paste0("Subgrp_AGE:",grp_vec[grp]),
+                                          pred_task=pred_task))
+              
+              subgrp_age %<>% 
+                bind_rows(grp_summ %>% 
+                            dplyr::mutate(size=nrow(valid_grp),
+                                          grp=paste0("Subgrp_AGE:",grp_vec[grp]),
+                                          pred_task=pred_task))
+              
+              subgrp_age_calib %<>%
+                bind_rows(get_calibr(pred=valid_grp$pred,
+                                     real=valid_grp$y) %>%
+                            dplyr::mutate(grp=paste0("Subgrp_AGE:",grp_vec[grp]),
+                                          pred_task=pred_task))
+            }
+            
+            #subgroup-scr
+            subgrp_scr_full<-c()
+            subgrp_scr<-c()
+            subgrp_scr_calib<-c()
+            grp_vec<-unique(valid$admit_scr)
+            for(grp in seq_along(grp_vec)){
+              valid_grp<-valid %>% filter(admit_scr==grp_vec[grp])
+              grp_summ<-get_perf_summ(pred=valid_grp$pred,
+                                      real=valid_grp$y,
+                                      keep_all_cutoffs=F)$perf_summ %>%
+                filter(overall_meas %in% perf_metrics)
+              
+              subgrp_scr_full %<>%
+                bind_rows(get_perf_summ(pred=valid_grp$pred,
+                                        real=valid_grp$y,
+                                        keep_all_cutoffs=T)$perf_at %>%
+                            dplyr::select(cutoff,rec_sens,spec,prec) %>%
+                            mutate(cutoff=round(cutoff,3)) %>%
+                            group_by(cutoff) %>%
+                            dplyr::summarise(rec_sens=mean(rec_sens),
+                                             spec=mean(spec),
+                                             prec=mean(prec),
+                                             .groups="drop") %>%
+                            dplyr::mutate(grp=paste0("Subgrp_Scr_Base:",grp_vec[grp]),
+                                          pred_task=pred_task))
+              
+              subgrp_scr %<>% 
+                bind_rows(grp_summ %>% 
+                            dplyr::mutate(size=nrow(valid_grp),
+                                          grp=paste0("Subgrp_Scr_Base:",grp_vec[grp]),
+                                          pred_task=pred_task))
+              
+              subgrp_scr_calib %<>%
+                bind_rows(get_calibr(pred=valid_grp$pred,
+                                     real=valid_grp$y) %>%
+                            dplyr::mutate(grp=paste0("Subgrp_Scr_Base:",grp_vec[grp]),
+                                          pred_task=pred_task))
+            }
+            
+            perf_full %<>%
+              bind_rows(subgrp_calyr_full) %>%
+              bind_rows(subgrp_day_full) %>%
+              bind_rows(subgrp_age_full) %>%
+              bind_rows(subgrp_scr_full) %>%
+              dplyr::mutate(pred_in_d=pred_in_d,fs_type=fs_type)
+            
+            perf_full_bs %<>%
+              bind_rows(perf_full %>% dplyr::mutate(boots=b))
+            
+            perf_overall %<>%
+              bind_rows(subgrp_calyr) %>%
+              bind_rows(subgrp_day) %>%
+              bind_rows(subgrp_age) %>%
+              bind_rows(subgrp_scr) %>%
+              dplyr::mutate(pred_in_d=pred_in_d,fs_type=fs_type) %>%
+              dplyr::mutate(meas_val=round(meas_val,4))
+            
+            perf_overall_bs %<>%
+              bind_rows(perf_overall %>% dplyr::mutate(boots=b))
+            
+            calib %<>%
+              bind_rows(subgrp_calyr_calib) %>%
+              bind_rows(subgrp_day_calib) %>%
+              bind_rows(subgrp_age_calib) %>%
+              bind_rows(subgrp_scr_calib) %>%
+              dplyr::mutate(pred_in_d=pred_in_d,fs_type=fs_type)
+            
+            perf_calib_bs %<>%
+              bind_rows(calib %>% dplyr::mutate(boots=b))
+          }
+          
+          #---------------------------------------------------------------------------------------------
+          lapse<-Sys.time()-start_i
+          cat(pred_in_d,",",params$site,",",pred_task,",",fs_type,",","...finished in",lapse,units(lapse),".\n")
+         }
       }
+}
+
+perf_full_bs %<>%
+  gather(meas,meas_val,-pred_in_d,-pred_task,-fs_type,-grp,-size,-boots,-cutoff) %>%
+                    group_by(pred_in_d,pred_task,fs_type,grp,size,cutoff,meas) %>%
+                    dplyr::summarize(meas_med=median(meas_val,na.rm=T),
+                                     meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
+                                     meas_ub=quantile(meas_val,probs=0.975,na.rm=T),
+                                     .groups="drop")
       
-      #--pre-filter
-      if(fs_type=="rm_scr_bun"){
-        X_ts %<>%
-          filter(!(key %in% c(rm_key,paste0(rm_key,"_change"))))
-      }
+perf_overall_bs %<>%
+  group_by(pred_in_d,pred_task,fs_type,grp,overall_meas) %>%
+                    dplyr::summarize(size=round(mean(size)),
+                                     meas_med=median(meas_val,na.rm=T),
+                                     meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
+                                     meas_ub=quantile(meas_val,probs=0.975,na.rm=T),
+                                     .groups="drop")
       
-      #--collect variables used in training
-      ref_mod<-readRDS(paste0("./data/model_kumc/",pred_in_d,"d_",fs_type,"_",pred_task,".rda"))$model
-      tr_key<-data.frame(key = ref_mod$feature_names,
-                         stringsAsFactors = F)
+perf_calib_bs %<>%
+  gather(overall_meas,meas_val,-pred_in_d,-pred_task,-fs_type,-pred_bin,-boots,-expos,-grp) %>%
+                    group_by(pred_in_d,pred_task,fs_type,pred_bin,overall_meas,grp,expos) %>%
+                    dplyr::summarize(meas_med=median(meas_val,na.rm=T),
+                                     meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
+                                     meas_ub=quantile(meas_val,probs=0.975,na.rm=T),
+                                     .groups="drop")
+```
+
+Three intermediate files were generated and saved under `data/model_kumc/` folder: 
+a) `site_perffull.rda` includes the full ROC and PRC profiles, with all cutoff points as well as all the corresponding sensitivity, specificity and PPV. This file will be used late to construct all AUROC and AUPRC figures;        
+b) `site_perfsumm.rda` includes higher level summary of model performance;            
+c) `site_calib.rda` includes detailed calibration results. 
+
+***
+
+
+#### Objective 2.2: Visualization of Validation Results
+
+```{r summ_fig_collector, include=F}
+int_valid<-perf_full_bs %>% dplyr::select(-size)
+
+end_pt<-int_valid %>% 
+  select(-cutoff,-meas,-meas_med,-meas_lb,-meas_ub) %>%
+  unique %>%
+  mutate(cutoff=-Inf,
+         rec_sens=1,
+         spec=0,
+         prec=0) %>%
+  gather(meas,meas_med,-pred_in_d,-pred_task,-fs_type,-grp,-cutoff) %>%
+  mutate(meas_lb=meas_med,
+         meas_ub=meas_med)
+
+
+int_valid %<>%
+  bind_rows(end_pt) %>%
+  mutate(grp_type=gsub(":.*","",grp),
+         grp_cat=gsub(".*:","",grp)) %>%
+  filter(!grp_cat %in% c("[3,Inf]") & !grp_cat %in% c(4,6,7) & 
+         !(fs_type=="rm_scr_bun"&grp_type!="Subgrp_VTYPE")) %>%
+  mutate(grp_type=recode(grp_type,
+                         "Subgrp_AGE"="Age",
+                         "Subgrp_DAY"="Daily",
+                         "Subgrp_Scr_Base"="Baseline Serum Creatinine",
+                         "Subgrp_VTYPE"="Validation Type"),
+         grp_cat=recode(grp_cat,
+                        `1`="1d",
+                        `2`="2d",
+                        `3`="3d",
+                        `5`="4d or more")) %>%
+  mutate(grp_cat=case_when(grp_cat=="int"&fs_type=="no_fs" ~ "Int. w/ all features",
+                           grp_cat=="int"&fs_type=="rm_scr_bun" ~ "Int. w/o Scr,BUN",
+                           grp_cat=="ext"&fs_type=="no_fs" ~ "Tmp.Ext. w/ all features",
+                           grp_cat=="ext"&fs_type=="rm_scr_bun" ~ "Tmp.Ext. w/o Scr,BUN",
+                           TRUE ~ grp_cat))
+
+
+#ROC and PRC summaries
+int_valid_summ<-perf_overall_bs %>%  dplyr::select(-size) %>%
+  dplyr::mutate(label=paste0(round(meas_med+0.005,2),
+                             " (",round(meas_lb+0.005,2),",",round(meas_ub+0.005,2),")"))
+
+int_valid_summ %<>%
+  mutate(grp_type=gsub(":.*","",grp),
+         grp_cat=gsub(".*:","",grp)) %>%
+  filter(!grp_cat %in% c("[3,Inf]") & !grp_cat %in% c(4,6,7) & 
+           !(fs_type=="rm_scr_bun"&grp_type!="Subgrp_VTYPE")) %>%
+  mutate(grp_type=recode(grp_type,
+                         "Subgrp_AGE"="Age",
+                         "Subgrp_DAY"="Daily",
+                         "Subgrp_Scr_Base"="Baseline Serum Creatinine",
+                         "Subgrp_VTYPE"="Validation Type"),
+         grp_cat=recode(grp_cat,
+                        `1`="1d",
+                        `2`="2d",
+                        `3`="3d",
+                        `5`="4d or more")) %>%
+  mutate(grp_cat=case_when(grp_cat=="int"&fs_type=="no_fs" ~ "Int. w/ all features",
+                           grp_cat=="int"&fs_type=="rm_scr_bun" ~ "Int. w/o Scr,BUN",
+                           grp_cat=="ext"&fs_type=="no_fs" ~ "Tmp.Ext. w/ all features",
+                           grp_cat=="ext"&fs_type=="rm_scr_bun" ~ "Tmp.Ext. w/o Scr,BUN",
+                           TRUE ~ grp_cat))
+
+
+##---overall ROC&PRC curves
+grp_type_sel<-c("Validation Type",
+                "Daily",
+                "Age",
+                "Baseline Serum Creatinine")
+
+int_roc<-list()
+int_prc<-list()
+int_calib_plot<-list()
+for(i in seq_along(pred_task_lst)){
+  roc_task<-int_valid %>%
+    filter(pred_task==pred_task_lst[i] & 
+           meas %in% c("spec") & 
+           grp_type != "Overall") %>%
+    select(-meas_lb,-meas_ub,-meas) %>%
+    dplyr::rename("spec"="meas_med") %>%
+    left_join(int_valid %>%
+                filter(meas %in% c("rec_sens") & pred_task==pred_task_lst[i] & grp_type != "Overall") %>%
+                dplyr::rename("sens"="meas_med") %>% select(-meas),
+              by=c("pred_in_d","pred_task","fs_type", "grp","cutoff","grp_type","grp_cat")) %>%
+    group_by(pred_in_d,pred_task,fs_type,grp,grp_type,grp_cat) %>%
+    arrange(desc(spec),desc(cutoff))  %>%
+    dplyr::mutate(sens2=cummax(sens),
+                  meas_lb2=cummax(meas_lb),
+                  meas_ub2=cummax(meas_ub)) %>%
+    ungroup
+  
+  prc_task<-int_valid %>%
+    filter(pred_task==pred_task_lst[i] & 
+           meas %in% c("rec_sens") & 
+           grp_type != "Overall") %>%
+    select(-meas_lb,-meas_ub,-meas) %>%
+    dplyr::rename("rec"="meas_med") %>%
+    left_join(int_valid %>%
+                filter(meas %in% c("prec") & pred_task==pred_task_lst[i] & grp_type != "Overall") %>%
+                dplyr::rename("prec"="meas_med") %>% select(-meas),
+              by=c("pred_in_d","pred_task","fs_type", "grp","cutoff","grp_type","grp_cat")) %>%
+    group_by(pred_in_d,pred_task,fs_type,grp,grp_type,grp_cat) %>%
+    arrange(desc(rec),desc(cutoff))  %>%
+    dplyr::mutate(prec2=cummax(prec),
+                  meas_lb2=cummax(meas_lb),
+                  meas_ub2=cummax(meas_ub)) %>%
+    ungroup
+  
+  for(d in c(1,2)){
+    
+    for(g in seq_along(grp_type_sel)){
       
-      #--transform testing matrix
-      y_ts %<>%
-        arrange(ENCOUNTERID,dsa_y) %>%
-        unite("ROW_ID",c("ENCOUNTERID","dsa_y")) %>%
-        arrange(ROW_ID) %>%
-        unique
+      roc_sub<-roc_task %>% 
+        filter(pred_in_d==d&grp_type==grp_type_sel[g])
       
-      X_ts %<>% 
-        unite("ROW_ID",c("ENCOUNTERID","dsa_y")) %>%
-        semi_join(y_ts,by="ROW_ID") %>%
-        semi_join(tr_key,by="key")
+      prc_sub<-prc_task %>% 
+        filter(pred_in_d==d&grp_type==grp_type_sel[g])
       
-      x_add<-tr_key %>%
-        anti_join(data.frame(key = unique(X_ts$key),
-                             stringsAsFactors = F),
-                  by="key")
+      annot_sub<-int_valid_summ %>%
+        filter(pred_task==pred_task_lst[i]&pred_in_d==d&grp_type==grp_type_sel[g])
       
-      #align with training
-      if(nrow(x_add)>0){
-        X_ts %<>%
-          arrange(ROW_ID) %>%
-          bind_rows(data.frame(ROW_ID = rep("0_0",nrow(x_add)),
-                               dsa = -99,
-                               key = x_add$key,
-                               value = 0,
-                               stringsAsFactors=F))
-      }
-      X_ts %<>%
-        long_to_sparse_matrix(df=.,
-                              id="ROW_ID",
-                              variable="key",
-                              val="value")
-      if(nrow(x_add)>0){
-        X_ts<-X_ts[-1,]
-      }
+      int_calib_sub<-int_calib_pvt %>% filter(pred_task==pred_task_lst[i]&pred_in_d==d&grp_type==grp_type_sel[g])
       
-      X_ts<-X_ts[,tr_key$key]
+      int_calib_hl_sub<-int_calib_hl %>% filter(pred_task==pred_task_lst[i]&pred_in_d==d&grp_type==grp_type_sel[g])
       
-      #check alignment
-      if (!all(row.names(X_ts)==y_ts$ROW_ID)){
-        stop("row ids of testing set don't match!")
-      }
+      annot_hl<-int_calib_hl_sub %>% 
+            mutate(hl_label=paste0(round(chi_sq_adj,2)," (",pmax(round(p_val_adj,3),0.0001),")"))
       
-      if (!all(ref_mod$feature_names==colnames(X_ts))){
-        stop("feature names don't match!")
-      }
+      axis_limits<-c(min(int_calib_sub$y_p,int_calib_sub$pred_p_adj),
+                     max(int_calib_sub$y_p,int_calib_sub$pred_p_adj))
       
-      #--covert to xgb data frame
-      dtest<-xgb.DMatrix(data=X_ts,label=y_ts$y)
+      int_roc[[paste0(i,d,g)]]<-ggplot(roc_sub,aes(x=(1-spec),y=sens2,color=grp_cat))+
+        # geom_smooth(method="gam",formula=y~s(x,bs="cs"))+
+        geom_rect(aes(xmin=0,xmax=0.1,ymin=0,ymax=Inf),alpha=0.1,fill="grey80",color="grey80")+
+        geom_line()+geom_point()+
+        geom_text(data=annot_sub %>% filter(overall_meas=="roauc") %>%
+                    arrange(grp_type,desc(grp_cat)) %>%
+                    mutate(x=0.6,y=row_number()/10) ,
+                         aes(x=x,y=y,color=grp_cat,label=label),
+                  fontface="bold",hjust = 0)+
+        geom_ribbon(aes(ymin=meas_lb2,ymax=meas_ub2,fill=grp_cat),alpha=0.1)+
+        geom_abline(slope=1,intercept=0,linetype=3)+
+        scale_x_continuous(limits = c(0,1))+
+        guides(color=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                  direction="vertical"),
+               fill=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                 direction="vertical"))+
+        theme(text=element_text(size=20,face="bold"))+
+        labs(x="",y="", color="",fill="") +
+        facet_wrap(~grp_type,scales="free",ncol=4)
       
-      #--validation
-      valid<-data.frame(y_ts,
-                        pred = predict(ref_mod,dtest),
-                        stringsAsFactors = F)
+      int_prc[[paste0(i,d,g)]]<-ggplot(prc_sub,aes(x=rec,y=prec2,color=grp_cat))+
+        # geom_smooth(method="gam",formula=y~s(x,bs="cs"))+
+        geom_line()+geom_point()+
+        geom_text(data=annot_sub %>% filter(overall_meas=="prauc1") %>%
+                    arrange(grp_type,grp_cat) %>%
+                    mutate(x=0.6,y=1-row_number()/10),
+                  aes(x=x,y=y,color=grp_cat,label=label),
+                  fontface="bold",hjust = 0)+
+        geom_ribbon(aes(ymin=meas_lb2,ymax=meas_ub2,fill=grp_cat),alpha=0.1)+
+        scale_x_continuous(limits = c(0,1))+
+        guides(color=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                  direction="vertical"),
+               fill=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                  direction="vertical"))+
+        theme(text=element_text(size=20,face="bold"))+
+        labs(x="",y="",color="",fill="") +
+        facet_wrap(~grp_type,scales="free",ncol=4)
       
-      #--save model and other results
-      saveRDS(valid,file=paste0("./data/model_kumc/",pred_in_d,"d_valid_gbm_",fs_type,"_",pred_task,".rda"))
-      #-------------------------------------------------------------------------------------------------------------
-      lapse_tsk<-Sys.time()-start_tsk
-      cat("\nFinish validating benchmark models for task:",pred_task,"in",pred_in_d,"with",fs_type,",in",lapse_tsk,units(lapse_tsk),".\n")
+      int_calib_plot[[paste0(i,d,g)]]<-ggplot(int_calib_sub,aes(y=y_p,x=pred_p_adj,color=grp_cat))+
+            geom_smooth(method="lm",size=1.5)+
+            # geom_line(size=1.3)+
+            geom_point(size=2.5)+
+            geom_abline(slope=1,intercept=0,linetype=2)+
+            #annotate with HL score
+            geom_text(data=annot_hl %>% arrange(grp_type,desc(grp_cat)) %>%
+                        mutate(x=qunif(row_number()*2/10,median(int_calib_sub$pred_p),max(int_calib_sub$pred_p)),
+                               y=qunif(row_number()*1.5/10,1e-4,max(int_calib_sub$pred_p))),
+                      aes(x=x,y=y,color=grp_cat,label=hl_label),
+                      fontface="bold",hjust = 0)+
+            guides(color=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                      direction="horizontal"),
+                   fill=guide_legend(keyheight=ifelse(g==1|(d==1&g==2),1.2,1.5),
+                                     direction="horizontal"))+
+            scale_x_continuous(limits=axis_limits)+
+            scale_y_continuous(limits=axis_limits)+
+            theme(text=element_text(size=15,face="bold"))+
+            labs(x="",y="",color="")+
+            facet_wrap(~grp_type,scales="free",ncol=2)
     }
   }
 }
-
-```
-
-For each prediction task, defined as "predict AKI stage X in Y days, with/without Scr", 1 intermedicate data file have been generated and saved in `./data/model_kumc/...`, which are: 
-
-* `...d_valid_gbm_...rda`: the predictted probability on validataion set;      
-
-
-***
-
-
-#### Objective 2.3: Performance Evaluations for Benchmark Model
-
-```{r perf_summ, include=F}
-rm(list=ls()[!(ls() %in% c("fs_type_opt","pred_task_lst",
-                           "get_perf_summ","get_calibr"))]);
-gc() #release some memory
-
-
-#-----performance meatrics
-perf_metrics<-c("roauc",
-                "prauc1",
-                "opt_sens",
-                "opt_spec",
-                "opt_ppv",
-                "opt_npv")
-
-#-----boostrapping parameters
-boots<-20
-
-#------auxiliary table (for subgroup analysis)
-tbl1<-readRDS("./data/Table1.rda") %>%
-  dplyr::select(ENCOUNTERID,SERUM_CREAT_BASE) %>%
-  inner_join(readRDS("./data/AKI_DEMO.rda") %>%
-              filter(key=="AGE") %>%
-              dplyr::select(ENCOUNTERID,key,value) %>%
-              spread(key,value) %>%
-              mutate(AGE=as.numeric(AGE)),
-            by="ENCOUNTERID")
-
-final_out<-list()
 ```
 
 
-#### Task I: 24-hour advanced prediction
+##### Task I: 48-hour advanced prediction
 
-```{r pred24hr, include=F}
+```{r pred48hr, include=F}
 pred_in_d<-1
 ```
 
-*(I.a) Overall Prediction Performance and Subgroup Analysis*   
+*(I.a) AUROC*
 
-```{r pred24_summ,echo=F}
-perf_cutoff<-c()
-perf_tbl<-c()
-calib_tbl<-c()
-
-for(pred_task in pred_task_lst){
-    
-    for(fs_type in fs_type_opt){
-      
-      valid_orig<-readRDS(paste0("./data/model_kumc/",pred_in_d,"d_valid_gbm_",fs_type,"_",pred_task,".rda")) %>%
-        mutate(ENCOUNTERID=gsub("_.*","",ROW_ID),
-               day_at=as.numeric(gsub(".*_","",ROW_ID))) %>%
-        left_join(tbl1,by="ENCOUNTERID") %>%
-        dplyr::mutate(age=cut(AGE,breaks=c(0,45,65,Inf),include.lowest=T,right=F)) %>%
-        mutate(admit_scr=cut(SERUM_CREAT_BASE,breaks=c(0,1,2,3,Inf),include.lowest=T,right=F))
-      
-      n<-nrow(valid_orig)
-      
-      perf_cutoff %<>%
-      bind_rows(get_perf_summ(pred=valid_orig$pred,
-                              real=valid_orig$y,
-                              keep_all_cutoffs=T)$perf_at %>%
-                  dplyr::mutate(pred_in_d=pred_in_d,
-                                pred_task=pred_task,
-                                fs_type=fs_type))
-      
-      for(b in 1:boots){
-        #--bootstrapping
-        idxset<-sample(1:n,n,replace=T)
-        valid<-valid_orig %>% dplyr::slice(idxset)
-        
-        #--collect performance metrics
-        #overall
-        perf_overall<-get_perf_summ(pred=valid$pred,
-                                    real=valid$y,
-                                    keep_all_cutoffs=F)$perf_summ %>%
-          dplyr::filter(overall_meas %in% perf_metrics) %>%
-          dplyr::mutate(size=nrow(valid),
-                        grp="Overall",
-                        pred_task=pred_task)
-        
-        calib<-get_calibr(pred=valid$pred,
-                          real=valid$y) %>%
-          mutate(pred_in_d=pred_in_d,
-                 fs_type=fs_type,
-                 pred_task=pred_task)
-        
-        #subgroup-age
-        subgrp_age<-c()
-        grp_vec<-unique(valid$age)
-        for(grp in seq_along(grp_vec)){
-          valid_grp<-valid %>% filter(age==grp_vec[grp])
-          grp_summ<-get_perf_summ(pred=valid_grp$pred,
-                                  real=valid_grp$y,
-                                  keep_all_cutoffs=F)$perf_summ %>%
-            dplyr::filter(overall_meas %in% perf_metrics)
-          
-          subgrp_age %<>% 
-            bind_rows(grp_summ %>% 
-                        dplyr::mutate(size=nrow(valid_grp),
-                                      grp=paste0("Subgrp_AGE:",grp_vec[grp]),
-                                      pred_task=pred_task))
-        }
-        
-        #subgroup-scr
-        subgrp_scr<-c()
-        grp_vec<-unique(valid$admit_scr)
-        for(grp in seq_along(grp_vec)){
-          valid_grp<-valid %>% filter(admit_scr==grp_vec[grp])
-          grp_summ<-get_perf_summ(pred=valid_grp$pred,
-                                  real=valid_grp$y,
-                                  keep_all_cutoffs=F)$perf_summ %>%
-            filter(overall_meas %in% perf_metrics)
-          
-          subgrp_scr %<>% 
-            bind_rows(grp_summ %>% 
-                        dplyr::mutate(size=nrow(valid_grp),
-                                      grp=paste0("Subgrp_Scr_Base:",grp_vec[grp]),
-                                      pred_task=pred_task))
-        }
-        
-        perf_overall %<>%
-          bind_rows(subgrp_age) %>%
-          bind_rows(subgrp_scr) %>%
-          dplyr::mutate(pred_in_d=pred_in_d,fs_type=fs_type) %>%
-          dplyr::mutate(meas_val=round(meas_val,4))
-        
-        perf_tbl %<>%
-          bind_rows(perf_overall %>% dplyr::mutate(boots=b))
-        
-        calib_tbl %<>%
-          bind_rows(calib %>% dplyr::mutate(boots=b))
-      }
-    }
-}
-
-perf_tbl %<>%
-  group_by(pred_in_d,pred_task,fs_type,grp,overall_meas) %>%
-    dplyr::summarize(size=round(mean(size)),
-                                meas_med=median(meas_val,na.rm=T),
-                                meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
-                                meas_ub=quantile(meas_val,probs=0.975,na.rm=T)) %>%
-                    ungroup
-    
-calib_tbl %<>%
-  gather(overall_meas,meas_val,-pred_in_d,-pred_task,-fs_type,-pred_bin,-boots) %>%
-                    group_by(pred_in_d,pred_task,fs_type,pred_bin,overall_meas) %>%
-                    dplyr::summarize(meas_med=median(meas_val,na.rm=T),
-                                     meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
-                                     meas_ub=quantile(meas_val,probs=0.975,na.rm=T)) %>%
-                    ungroup
-    
-
-perf_tbl %<>%
-  dplyr::select(pred_in_d,fs_type,grp,pred_task,overall_meas,meas_med,meas_lb,meas_ub) %>%
-  dplyr::mutate(pred_task=recode(pred_task,
-                                 `stg1up`="a.AKI>=1",
-                                 `stg2up`="b.AKI>=2",
-                                 `stg3`="c.AKI=3",
-                                 `stg3up`="c.AKI=3"),
-                meas_med=round(meas_med,4),
-                meas_lb=round(meas_lb,4),
-                meas_ub=round(meas_ub,4)) %>%
-  dplyr::mutate(meas_ci = paste0(meas_med,"(",meas_lb,",",meas_ub,")"))
-
-perf_overall<-perf_tbl %>% 
-  dplyr::select(pred_in_d,fs_type,grp,pred_task,overall_meas,meas_ci) %>%
-  dplyr::mutate(overall_meas=recode(overall_meas,
-                                    roauc="1.ROAUC",
-                                    prauc1="2.PRAUC",
-                                    opt_sens="3.Optimal Sensitivity",
-                                    opt_spec="4.Optimal Specificity",
-                                    opt_ppv="5.Optimal Positive Predictive Value",
-                                    opt_npv="6.Optimal Negative Predictive Value")) %>%
-  spread(overall_meas,meas_ci)
-
-row_grp_pos<-perf_overall %>% 
-  arrange(grp,pred_task) %>%
-  mutate(rn=1:n()) %>%
-  dplyr::mutate(root_grp=gsub(":.*","",grp)) %>%
-  group_by(root_grp,pred_in_d) %>%
-  dplyr::summarize(begin=rn[1],
-                   end=rn[n()]) %>%
-  ungroup
-
-kable(perf_overall %>% arrange(grp,pred_task),
-      caption="Table1 - 24-Hour Prediction of AKI1, AKI2, AKI3") %>%
-  kable_styling("striped", full_width = F) %>%
-  group_rows("Overall", row_grp_pos$begin[1],row_grp_pos$end[1]) %>%
-  group_rows("Subgroup-Age", row_grp_pos$begin[2],row_grp_pos$end[2]) %>%
-  group_rows("Subgroup-Scr_Base", row_grp_pos$begin[3],row_grp_pos$end[3])
-
-final_out[["pred24_summ"]]<-list(perf_tbl=perf_tbl,calib_tbl=calib_tbl)
+```{r pred48_auroc,echo=F}
+fig1<-ggarrange(ggarrange(int_roc[["121"]],int_roc[["221"]],int_roc[["321"]],ncol=1,nrow=3,legend = "bottom",common.legend =T,
+                          labels=c("A.Any AKI","B.AKI >= 2","C.AKI 3"),hjust=-0.1,vjust = 1.2,font.label=list(color="red")),
+                ggarrange(int_roc[["122"]],int_roc[["222"]],int_roc[["322"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                ggarrange(int_roc[["123"]],int_roc[["223"]],int_roc[["323"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                ggarrange(int_roc[["124"]],int_roc[["224"]],int_roc[["324"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                ncol=4)
+annotate_figure(fig1,
+                left=text_grob("Sensitivity",rot=90,face="bold",size=20),
+                bottom=text_grob("1-Specificity",face="bold",size=20,vjust=-6))
 ```
 
 
-*(I.b) Full metric paths at various cutoff points*
+*(I.b) AUPRC*
 
-```{r pred24_cutoff, echo=F,fig.height = 5, fig.width = 12}
-#plot out sens, spec, ppv, npv on a scale of cutoff probabilities
-brks<-unique(c(0,seq(0.001,0.01,by=0.001),seq(0.02,0.1,by=0.01),seq(0.2,1,by=0.1)))
-pred24_cutoff_plot<-list()
+```{r pred24_auprc, echo=F,fig.height = 5, fig.width = 12}
+extfig1<-ggarrange(ggarrange(int_prc[["121"]],int_prc[["221"]],int_prc[["321"]],ncol=1,nrow=3,legend = "bottom",common.legend =T,
+                             labels=c("A.Any AKI","B.AKI >= 2","C.AKI 3"),hjust=-0.1,vjust = 1.2,font.label=list(color="red")),
+                   ggarrange(int_prc[["122"]],int_prc[["222"]],int_prc[["322"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                   ggarrange(int_prc[["123"]],int_prc[["223"]],int_prc[["323"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                   ggarrange(int_prc[["124"]],int_prc[["224"]],int_prc[["324"]],ncol=1,nrow=3,legend = "bottom",common.legend =T),
+                   ncol=4)
 
-for(fs_type in fs_type_opt){
-
-  perf_cutoff_fs<-perf_cutoff %>%
-    dplyr::filter(fs_type==fs_type) %>%
-    dplyr::select(cutoff,rec_sens,spec,ppv,npv,pred_task) %>%
-    mutate(bin=cut(cutoff,breaks=brks,include.lowest=T,label=F)) %>%
-    group_by(bin,pred_task) %>%
-    dplyr::summarise(cutoff=round(max(cutoff),3),
-                     sens_l=quantile(rec_sens,0.025,na.rm=T),
-                     sens=median(rec_sens,na.rm=T),
-                     sens_u=quantile(rec_sens,0.975,na.rm=T),
-                     spec_l=quantile(spec,0.025,na.rm=T),
-                     spec=median(spec,na.rm=T),
-                     spec_u=quantile(spec,0.975,na.rm=T),
-                     ppv_l=quantile(ppv,0.025,na.rm=T),
-                     ppv=median(ppv,na.rm=T),
-                     ppv_u=quantile(ppv,0.975,na.rm=T),
-                     npv_l=quantile(npv,0.025,na.rm=T),
-                     npv=median(npv,na.rm=T),
-                     npv_u=quantile(npv,0.975,na.rm=T)) %>%
-    ungroup %>% dplyr::select(-bin) %>%
-    gather(metric_type,metric_val,-cutoff,-pred_task) %>%
-    mutate(metric_type2=ifelse(grepl("_l",metric_type),"low",
-                               ifelse(grepl("_u",metric_type),"up","mid")),
-           metric_type=gsub("_.*","",metric_type)) %>%
-    spread(metric_type2,metric_val) %>%
-    mutate(pred_task=recode(pred_task,
-                            `stg1up`="a.AKI>=1",
-                            `stg2up`="b.AKI>=2",
-                            `stg3`="c.AKI=3"))
-  
-  pred24_cutoff_plot[[fs_type]]<-ggplot(perf_cutoff_fs %>% dplyr::filter(cutoff <=0.15),
-                                        aes(x=cutoff,y=mid,color=metric_type,fill=metric_type))+
-    geom_line()+ geom_ribbon(aes(ymin=low,ymax=up),alpha=0.3)+
-    labs(x="cutoff probability",y="performance metrics",
-         title=paste0("Figure A.",which(fs_type_opt==fs_type)," - Metrics at different cutoff points:",fs_type))+
-    facet_wrap(~pred_task,scales="free",ncol=3)
-  
-  final_out[[paste0("pred24_cutoff_",fs_type)]]<-perf_cutoff_fs
-}
-print(pred24_cutoff_plot[[1]])
-print(pred24_cutoff_plot[[2]])
-```
-
-
-*(I.c) Calibration Plots*
-
-```{r pred24_calib, echo=F, fig.height = 5, fig.width = 12}
-pred24_calib_plot<-list()
-
-# plot calibration
-for(fs_type in fs_type_opt){
-  
-  calib_tbl_fs<-calib_tbl %>%
-    dplyr::filter(fs_type==fs_type) %>%
-    mutate(pred_task=recode(pred_task,
-                            `stg1up`="a.AKI>=1",
-                            `stg2up`="b.AKI>=2",
-                            `stg3`="c.AKI=3"))
-  
-  calib_tbl_fs_plot<-calib_tbl_fs %>%
-    dplyr::filter(overall_meas=="y_p") %>%
-    left_join(calib_tbl_fs %>%
-                dplyr::filter(overall_meas=="pred_p") %>%
-                dplyr::select(pred_in_d,pred_task,fs_type,pred_bin,meas_med) %>%
-                dplyr::rename(pred_p=meas_med),
-              by=c("pred_in_d","pred_task","fs_type","pred_bin"))
-  
-  pred24_calib_plot[[fs_type]]<-ggplot(calib_tbl_fs_plot,aes(x=pred_p,y=meas_med))+
-    geom_point()+geom_abline(intercept=0,slope=1)+
-    geom_errorbar(aes(ymin=meas_lb,ymax=meas_ub))+
-    labs(x="Predicted Probability",y="Actual Probability",
-         title=paste0("Figure B.",which(fs_type_opt==fs_type)," - Calibration:",fs_type))+
-    facet_wrap(~pred_task,scales="free")
-  
-  final_out[[paste0("pred24_calibr_",fs_type)]]<-calib_tbl_fs
-}
-print(pred24_calib_plot[[1]])
-print(pred24_calib_plot[[2]])
+annotate_figure(extfig1,
+                left=text_grob("Precision",rot=90,face="bold",size=20),
+                bottom=text_grob("Recall (Sensitivity)",face="bold",size=20,vjust=-6))
 ```
 
 
 ***
 
 
-#### Task II: 48-hour advanced prediction
+#### Task II: 24-hour advanced prediction
 
-```{r pred48hr, include=F}
+```{r pred24hr, include=F}
 pred_in_d<-2
 ```
 
-*(II.a) Overall Prediction Performance*
+*(II.a) AUROC*
 
-```{r pred48_summ,echo=F}
-perf_cutoff<-c()
-perf_tbl<-c()
-calib_tbl<-c()
+```{r pred24_auroc,echo=F}
 
-for(pred_task in pred_task_lst){
-    
-    for(fs_type in fs_type_opt){
-      
-      valid_orig<-readRDS(paste0("./data/model_kumc/",pred_in_d,"d_valid_gbm_",fs_type,"_",pred_task,".rda")) %>%
-        mutate(ENCOUNTERID=gsub("_.*","",ROW_ID),
-               day_at=as.numeric(gsub(".*_","",ROW_ID))) %>%
-        left_join(tbl1,by="ENCOUNTERID") %>%
-        dplyr::mutate(age=cut(AGE,breaks=c(0,45,65,Inf),include.lowest=T,right=F)) %>%
-        mutate(admit_scr=cut(SERUM_CREAT_BASE,breaks=c(0,1,2,3,Inf),include.lowest=T,right=F))
-      
-      n<-nrow(valid_orig)
-      
-      perf_cutoff %<>%
-      bind_rows(get_perf_summ(pred=valid_orig$pred,
-                              real=valid_orig$y,
-                              keep_all_cutoffs=T)$perf_at %>%
-                  dplyr::mutate(pred_in_d=pred_in_d,
-                                pred_task=pred_task,
-                                fs_type=fs_type))
-      
-      for(b in 1:boots){
-        #--bootstrapping
-        idxset<-sample(1:n,n,replace=T)
-        valid<-valid_orig %>% dplyr::slice(idxset)
-        
-        #--collect performance metrics
-        #overall
-        perf_overall<-get_perf_summ(pred=valid$pred,
-                                    real=valid$y,
-                                    keep_all_cutoffs=F)$perf_summ %>%
-          dplyr::filter(overall_meas %in% perf_metrics) %>%
-          dplyr::mutate(size=nrow(valid),
-                        grp="Overall",
-                        pred_task=pred_task)
-        
-        calib<-get_calibr(pred=valid$pred,
-                          real=valid$y) %>%
-          mutate(pred_in_d=pred_in_d,
-                 fs_type=fs_type,
-                 pred_task=pred_task)
-        
-        #subgroup-age
-        subgrp_age<-c()
-        grp_vec<-unique(valid$age)
-        for(grp in seq_along(grp_vec)){
-          valid_grp<-valid %>% filter(age==grp_vec[grp])
-          grp_summ<-get_perf_summ(pred=valid_grp$pred,
-                                  real=valid_grp$y,
-                                  keep_all_cutoffs=F)$perf_summ %>%
-            dplyr::filter(overall_meas %in% perf_metrics)
-          
-          subgrp_age %<>% 
-            bind_rows(grp_summ %>% 
-                        dplyr::mutate(size=nrow(valid_grp),
-                                      grp=paste0("Subgrp_AGE:",grp_vec[grp]),
-                                      pred_task=pred_task))
-        }
-        
-        #subgroup-scr
-        subgrp_scr<-c()
-        grp_vec<-unique(valid$admit_scr)
-        for(grp in seq_along(grp_vec)){
-          valid_grp<-valid %>% filter(admit_scr==grp_vec[grp])
-          grp_summ<-get_perf_summ(pred=valid_grp$pred,
-                                  real=valid_grp$y,
-                                  keep_all_cutoffs=F)$perf_summ %>%
-            filter(overall_meas %in% perf_metrics)
-          
-          subgrp_scr %<>% 
-            bind_rows(grp_summ %>% 
-                        dplyr::mutate(size=nrow(valid_grp),
-                                      grp=paste0("Subgrp_Scr_Base:",grp_vec[grp]),
-                                      pred_task=pred_task))
-        }
-        
-        perf_overall %<>%
-          bind_rows(subgrp_age) %>%
-          bind_rows(subgrp_scr) %>%
-          dplyr::mutate(pred_in_d=pred_in_d,fs_type=fs_type) %>%
-          dplyr::mutate(meas_val=round(meas_val,4))
-        
-        perf_tbl %<>%
-          bind_rows(perf_overall %>% dplyr::mutate(boots=b))
-        
-        calib_tbl %<>%
-          bind_rows(calib %>% dplyr::mutate(boots=b))
-      }
-    }
-}
-
-perf_tbl %<>%
-  group_by(pred_in_d,pred_task,fs_type,grp,overall_meas) %>%
-    dplyr::summarize(size=round(mean(size)),
-                                meas_med=median(meas_val,na.rm=T),
-                                meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
-                                meas_ub=quantile(meas_val,probs=0.975,na.rm=T)) %>%
-                    ungroup
-    
-calib_tbl %<>%
-  gather(overall_meas,meas_val,-pred_in_d,-pred_task,-fs_type,-pred_bin,-boots) %>%
-                    group_by(pred_in_d,pred_task,fs_type,pred_bin,overall_meas) %>%
-                    dplyr::summarize(meas_med=median(meas_val,na.rm=T),
-                                     meas_lb=quantile(meas_val,probs=0.025,na.rm=T),
-                                     meas_ub=quantile(meas_val,probs=0.975,na.rm=T)) %>%
-                    ungroup
-    
-
-perf_tbl %<>%
-  dplyr::select(pred_in_d,fs_type,grp,pred_task,overall_meas,meas_med,meas_lb,meas_ub) %>%
-  dplyr::mutate(pred_task=recode(pred_task,
-                                 `stg1up`="a.AKI>=1",
-                                 `stg2up`="b.AKI>=2",
-                                 `stg3`="c.AKI=3",
-                                 `stg3up`="c.AKI=3"),
-                meas_med=round(meas_med,4),
-                meas_lb=round(meas_lb,4),
-                meas_ub=round(meas_ub,4)) %>%
-  dplyr::mutate(meas_ci = paste0(meas_med,"(",meas_lb,",",meas_ub,")"))
-
-perf_overall<-perf_tbl %>% 
-  dplyr::select(pred_in_d,fs_type,grp,pred_task,overall_meas,meas_ci) %>%
-  dplyr::mutate(overall_meas=recode(overall_meas,
-                                    roauc="1.ROAUC",
-                                    prauc1="2.PRAUC",
-                                    opt_sens="3.Optimal Sensitivity",
-                                    opt_spec="4.Optimal Specificity",
-                                    opt_ppv="5.Optimal Positive Predictive Value",
-                                    opt_npv="6.Optimal Negative Predictive Value")) %>%
-  spread(overall_meas,meas_ci)
-
-row_grp_pos<-perf_overall %>% 
-  arrange(grp,pred_task) %>%
-  mutate(rn=1:n()) %>%
-  dplyr::mutate(root_grp=gsub(":.*","",grp)) %>%
-  group_by(root_grp,pred_in_d) %>%
-  dplyr::summarize(begin=rn[1],
-                   end=rn[n()]) %>%
-  ungroup
-
-kable(perf_overall %>% arrange(grp,pred_task),
-      caption="Table1 - 48-Hour Prediction of AKI1, AKI2, AKI3") %>%
-  kable_styling("striped", full_width = F) %>%
-  group_rows("Overall", row_grp_pos$begin[1],row_grp_pos$end[1]) %>%
-  group_rows("Subgroup-Age", row_grp_pos$begin[2],row_grp_pos$end[2]) %>%
-  group_rows("Subgroup-Scr_Base", row_grp_pos$begin[3],row_grp_pos$end[3])
-
-final_out[["pred48_summ"]]<-list(perf_tbl=perf_tbl,calib_tbl=calib_tbl)
 ```
 
 
-*(II.b) Full metric paths at various cutoff points*
+*(II.b) AUPRC*
 
-```{r pred48_cutoff,echo=F, fig.height = 5, fig.width = 12}
-#plot out sens, spec, ppv, npv on a scale of cutoff probabilities
-brks<-unique(c(0,seq(0.001,0.01,by=0.001),seq(0.02,0.1,by=0.01),seq(0.2,1,by=0.1)))
-pred48_cutoff_plot<-list()
+```{r pred24_auprc,echo=F, fig.height = 5, fig.width = 12}
 
-for(fs_type in fs_type_opt){
-
-  perf_cutoff_fs<-perf_cutoff %>%
-    dplyr::filter(fs_type==fs_type) %>%
-    dplyr::select(cutoff,rec_sens,spec,ppv,npv,pred_task) %>%
-    mutate(bin=cut(cutoff,breaks=brks,include.lowest=T,label=F)) %>%
-    group_by(bin,pred_task) %>%
-    dplyr::summarise(cutoff=round(max(cutoff),3),
-                     sens_l=quantile(rec_sens,0.025,na.rm=T),
-                     sens=median(rec_sens,na.rm=T),
-                     sens_u=quantile(rec_sens,0.975,na.rm=T),
-                     spec_l=quantile(spec,0.025,na.rm=T),
-                     spec=median(spec,na.rm=T),
-                     spec_u=quantile(spec,0.975,na.rm=T),
-                     ppv_l=quantile(ppv,0.025,na.rm=T),
-                     ppv=median(ppv,na.rm=T),
-                     ppv_u=quantile(ppv,0.975,na.rm=T),
-                     npv_l=quantile(npv,0.025,na.rm=T),
-                     npv=median(npv,na.rm=T),
-                     npv_u=quantile(npv,0.975,na.rm=T)) %>%
-    ungroup %>% dplyr::select(-bin) %>%
-    gather(metric_type,metric_val,-cutoff,-pred_task) %>%
-    mutate(metric_type2=ifelse(grepl("_l",metric_type),"low",
-                               ifelse(grepl("_u",metric_type),"up","mid")),
-           metric_type=gsub("_.*","",metric_type)) %>%
-    spread(metric_type2,metric_val) %>%
-    mutate(pred_task=recode(pred_task,
-                            `stg1up`="a.AKI>=1",
-                            `stg2up`="b.AKI>=2",
-                            `stg3`="c.AKI=3"))
-  
-  pred48_cutoff_plot[[fs_type]]<-ggplot(perf_cutoff_fs %>% dplyr::filter(cutoff <=0.15),
-                                        aes(x=cutoff,y=mid,color=metric_type,fill=metric_type))+
-    geom_line()+ geom_ribbon(aes(ymin=low,ymax=up),alpha=0.3)+
-    labs(x="cutoff probability",y="performance metrics",
-         title=paste0("Figure C.",which(fs_type_opt==fs_type)," - Metrics at different cutoff points:",fs_type))+
-    facet_wrap(~pred_task,scales="free",ncol=3)
-  
-  final_out[[paste0("pred48_cutoff_",fs_type)]]<-perf_cutoff_fs
-}
-print(pred48_cutoff_plot[[1]])
-print(pred48_cutoff_plot[[2]])
-```
-
-
-*(II.c) Calibration Plots*
-
-```{r pred48_calib,echo=F, fig.height = 5, fig.width = 12}
-pred48_calib_plot<-list()
-
-# plot calibration
-for(fs_type in fs_type_opt){
-  
-  calib_tbl_fs<-calib_tbl %>%
-    dplyr::filter(fs_type==fs_type) %>%
-    mutate(pred_task=recode(pred_task,
-                            `stg1up`="a.AKI>=1",
-                            `stg2up`="b.AKI>=2",
-                            `stg3`="c.AKI=3"))
-  
-  calib_tbl_fs_plot<-calib_tbl_fs %>%
-    dplyr::filter(overall_meas=="y_p") %>%
-    left_join(calib_tbl_fs %>%
-                dplyr::filter(overall_meas=="pred_p") %>%
-                dplyr::select(pred_in_d,pred_task,fs_type,pred_bin,meas_med) %>%
-                dplyr::rename(pred_p=meas_med),
-              by=c("pred_in_d","pred_task","fs_type","pred_bin"))
-  
-  pred48_calib_plot[[fs_type]]<-ggplot(calib_tbl_fs_plot,aes(x=pred_p,y=meas_med))+
-    geom_point()+geom_abline(intercept=0,slope=1)+
-    geom_errorbar(aes(ymin=meas_lb,ymax=meas_ub))+
-    labs(x="Predicted Probability",y="Actual Probability",
-         title=paste0("Figure D.",which(fs_type_opt==fs_type)," - Calibration:",fs_type))+
-    facet_wrap(~pred_task,scales="free")
-  
-  final_out[[paste0("pred48_calibr_",fs_type)]]<-calib_tbl_fs
-}
-print(pred48_calib_plot[[1]])
-print(pred48_calib_plot[[2]])
 ```
 
 
 ***
 
 ```{r final, include=F}
-saveRDA(final_out,file="./output/AKI_CDM_EXT_VALID_p2_1_Benchmark_TBL.rda")
+#--save validation results
+saveRDS(perf_full_bs,file=paste0("./data/model_kumc/site_perffull.rda"))
+saveRDS(perf_overall_bs,file=paste0("./data/model_kumc/site_perfsumm.rda"))
+saveRDS(perf_calib_bs,file=paste0("./data/model_kumc/site_calib.rda"))
 
 # ggplot sometimes create some unwanted empty .pdf file and want to clean it up
 if(file.exists("./Rplots.pdf")){
